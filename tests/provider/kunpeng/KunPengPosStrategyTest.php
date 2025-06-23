@@ -21,7 +21,7 @@ class KunPengPosStrategyTest extends TestCase
     private $config;
     private $strategy;
 
-    // Generated RSA key pair for testing (2048 bits)
+    // Generated RSA key pair for testing (2048 bits) - These are needed for KunPengPosStrategy instance
     // 我方私钥 (for signing requests, decrypting AES key encrypted by Kunpeng Public Key - though for test we use mock Kunpeng public key)
     private const MY_PRIVATE_KEY_PEM = <<<EOT
 -----BEGIN RSA PRIVATE KEY-----
@@ -47,7 +47,7 @@ ZQHz7rXwD8+4xZc3YF9P9vN9L3rZ6PzN8vO7M9b8dY2xX7Y8vQ6rX6sN3xW1uV
 -----END RSA PRIVATE KEY-----
 EOT;
 
-    // 我方公钥 (for Kunpeng to verify our signature, encrypt AES key to us - though for test we use mock Kunpeng private key to encrypt)
+    // 我方公钥
     private const MY_PUBLIC_KEY_PEM = <<<EOT
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0R+xJ0vPmgDrRT8OzvSM
@@ -60,8 +60,8 @@ HM9K7nIpwvZo1vskNcL2PFgYvB6JqnMqEAjYgA3x55q/GWM2T0OFY34KM1X0JQxN
 -----END PUBLIC KEY-----
 EOT;
 
-    // 模拟鲲鹏平台的私钥 (for signing responses/callbacks to us, decrypting AES key encrypted by My Public Key)
-    private const KUNPENG_PRIVATE_KEY_PEM = <<<EOT
+    // 模拟鲲鹏平台的私钥
+    private const KUNPENG_PLATFORM_PRIVATE_KEY_PEM = <<<EOT
 -----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAtyPMXIbB0oSTtZEAEbkD8g63pXyYy59XWzO8y2yX8DkL7e6X
 xGfXJ6mZ7rX8sT9qX3T5nL3rV/sDxJ/n9g8B7S3kZ/P9e7X6vW+wS8Z7L5oY9sX
@@ -79,8 +79,8 @@ ZQHz7rXwD8+4xZc3YF9P9vN9L3rZ6PzN8vO7M9b8dY2xX7Y8vQ6rX6sN3xW1uV
 -----END RSA PRIVATE KEY-----
 EOT;
 
-    // 模拟鲲鹏平台的公钥 (for us to verify their signature, encrypt AES key to them)
-    private const KUNPENG_PUBLIC_KEY_PEM = <<<EOT
+    // 模拟鲲鹏平台的公钥
+    private const KUNPENG_PLATFORM_PUBLIC_KEY_PEM = <<<EOT
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtyPMXIbB0oSTtZEAEbkD
 8g63pXyYy59XWzO8y2yX8DkL7e6XxGfXJ6mZ7rX8sT9qX3T5nL3rV/sDxJ/n9g8B
@@ -97,8 +97,8 @@ EOT;
         $this->config = [
             'test' => true,
             'appId' => 'TEST_APP_ID',
-            'privateKey' => self::MY_PRIVATE_KEY_PEM, // 我方私钥
-            'kunPengPublicKey' => self::KUNPENG_PUBLIC_KEY_PEM, // 鲲鹏公钥
+            'privateKey' => self::MY_PRIVATE_KEY_PEM,
+            'kunPengPublicKey' => self::KUNPENG_PLATFORM_PUBLIC_KEY_PEM,
             'gateway' => 'https://fake.kunpeng.com/api',
             'testGateway' => 'https://fake-test.kunpeng.com/api',
         ];
@@ -106,127 +106,27 @@ EOT;
 
         // Mock HttpClient to avoid actual HTTP calls
         // This is a simple mock, a more robust solution might use a library like Mockery
-        $this->httpClientMock = $this->getMockBuilder(\shali\phpmate\http\HttpClient::class)
-                                     ->onlyMethods(['post', 'getRawResponse'])
-                                     ->getMock();
-
-        // Reflection to set the httpClient property if it's private/protected in KunPengPosStrategy
-        // Or, modify KunPengPosStrategy to allow httpClient injection for testing.
-        // For now, assuming direct calls will be made and we test data prep/processing.
+        // $this->httpClientMock = $this->getMockBuilder(\shali\phpmate\http\HttpClient::class)
+        //                              ->onlyMethods(['post', 'getRawResponse'])
+        //                              ->getMock();
+        // For KunPengPosStrategy, actual http client is instantiated inside methods,
+        // so mocking it here directly doesn't affect the strategy unless we inject it.
+        // The tests for prepareRequestData/processResponseData will test the crypto logic
+        // which is now in KunPengCryptoUtil, so KunPengPosStrategyTest focuses more on
+        // the interaction and DTO mapping.
     }
 
-    // Helper to access private/protected methods for testing
-    private function callProtectedMethod($object, string $methodName, array $parameters = [])
+    // Helper to access protected methods (prepareRequestData, processResponseData, processCallbackData)
+    // Note: This is generally discouraged for unit testing private/protected methods directly.
+    // It's better to test them via public interface.
+    // However, for these specific protected methods that encapsulate core logic, it can be useful.
+    // For private crypto methods, they are now in KunPengCryptoUtil and tested there.
+    private function callStrategyProtectedMethod(string $methodName, array $parameters = [])
     {
-        $className = get_class($object);
-        $reflection = new \ReflectionClass($className);
+        $reflection = new \ReflectionClass(KunPengPosStrategy::class);
         $method = $reflection->getMethod($methodName);
         $method->setAccessible(true);
-        return $method->invokeArgs($object, $parameters);
-    }
-
-    public function testGenerateAesKey()
-    {
-        $key = $this->callProtectedMethod($this->strategy, 'generateAesKey');
-        $this->assertEquals(16, strlen($key));
-        $this->assertMatchesRegularExpression('/^[a-zA-Z0-9]{16}$/', $key);
-    }
-
-    public function testAesEncryptionDecryption()
-    {
-        $aesKey = $this->callProtectedMethod($this->strategy, 'generateAesKey');
-        $data = "This is a secret message for AES!";
-
-        $encrypted = $this->callProtectedMethod($this->strategy, 'aesEncrypt', [$data, $aesKey]);
-        $this->assertNotEmpty($encrypted);
-        $this->assertNotEquals($data, $encrypted);
-
-        $decrypted = $this->callProtectedMethod($this->strategy, 'aesDecrypt', [$encrypted, $aesKey]);
-        $this->assertEquals($data, $decrypted);
-    }
-
-    public function testRsaEncryptionDecryption()
-    {
-        // Test RSA encryption with Kunpeng's Public Key and decryption with My Private Key (typical for AES key decryption)
-        $dataToEncrypt = "secret_aes_key_example";
-        $encryptedWithKunpengPublic = $this->callProtectedMethod($this->strategy, 'rsaEncrypt', [$dataToEncrypt, self::KUNPENG_PUBLIC_KEY_PEM]);
-        $this->assertNotEmpty($encryptedWithKunpengPublic);
-
-        // This would be done by Kunpeng with My Public Key, so we simulate it:
-        // $encryptedWithMyPublic = $this->callProtectedMethod($this->strategy, 'rsaEncrypt', [$dataToEncrypt, self::MY_PUBLIC_KEY_PEM]);
-        // $decryptedWithKunpengPrivate = $this->callProtectedMethod($this->strategy, 'rsaDecrypt', [$encryptedWithMyPublic, self::KUNPENG_PRIVATE_KEY_PEM]);
-        // $this->assertEquals($dataToEncrypt, $decryptedWithKunpengPrivate);
-
-        // Test decrypting something encrypted with Kunpeng's public key (which is what we do for their response's AES key)
-        // This requires us to have Kunpeng's *private* key to encrypt for this test scenario, which we simulated as KUNPENG_PRIVATE_KEY_PEM
-        // So, encrypt with KUNPENG_PRIVATE_KEY (simulating Kunpeng encrypting for us using their private key - this is not standard for RSA public key crypto)
-        // More accurately: Kunpeng encrypts AES key with *Our Public Key*. We decrypt with *Our Private Key*.
-        // Let's test the path where we decrypt AES key from Kunpeng:
-        // 1. Kunpeng generates AES key.
-        // 2. Kunpeng encrypts AES key with *Our Public Key* (MY_PUBLIC_KEY_PEM).
-        // 3. We receive it and decrypt with *Our Private Key* (MY_PRIVATE_KEY_PEM).
-
-        $aesKeyByKunpeng = "TestAesKey123456"; // 16 chars
-        // Simulate Kunpeng encrypting this AES key with MY_PUBLIC_KEY_PEM
-        // For this, we need an RSA encrypt function that takes a public key.
-        // $kunpengEncryptedAesKey = RsaUtil::publicEncrypt($aesKeyByKunpeng, self::MY_PUBLIC_KEY_PEM); // Assuming RsaUtil is accessible and works
-        // Let's use the strategy's own rsaEncrypt but with MY_PUBLIC_KEY_PEM
-        $tempStrategyForMyKeys = new KunPengPosStrategy([
-            'privateKey' => self::MY_PRIVATE_KEY_PEM,
-            'kunPengPublicKey' => self::MY_PUBLIC_KEY_PEM // Temporarily use my public as "kunpeng's" for this specific test
-        ]);
-        $kunpengEncryptedAesKey = $this->callProtectedMethod($tempStrategyForMyKeys, 'rsaEncrypt', [$aesKeyByKunpeng, self::MY_PUBLIC_KEY_PEM]);
-
-
-        $decryptedAesKey = $this->callProtectedMethod($this->strategy, 'rsaDecrypt', [$kunpengEncryptedAesKey, self::MY_PRIVATE_KEY_PEM]);
-        $this->assertEquals($aesKeyByKunpeng, $decryptedAesKey);
-    }
-
-    public function testBuildSignString()
-    {
-        $data = [
-            'timestamp' => '1694505252824',
-            'appId' => '91272436',
-            'serviceType' => 'PAY_ORDER',
-            'data' => 'someencrypteddata',
-            'encryptKey' => 'anotherencryptedkey',
-            'sign' => 'shouldberemoved',
-            'z_param' => 'last',
-            'a_param' => 'first',
-            'empty_param' => '',
-            'null_param' => null,
-        ];
-        $expected = "a_param=first&appId=91272436&data=someencrypteddata&encryptKey=anotherencryptedkey&serviceType=PAY_ORDER&timestamp=1694505252824&z_param=last";
-        $actual = $this->callProtectedMethod($this->strategy, 'buildSignString', [$data]);
-        $this->assertEquals($expected, $actual);
-    }
-
-    public function testSignatureGenerationAndVerification()
-    {
-        $data = [
-            'appId' => $this->config['appId'],
-            'timestamp' => (string)(int)(microtime(true) * 1000),
-            'data' => 'somedata',
-            'encryptKey' => 'somekey'
-        ];
-
-        // Sign with My Private Key
-        $signature = $this->callProtectedMethod($this->strategy, 'generateSign', [$data, self::MY_PRIVATE_KEY_PEM]);
-        $this->assertNotEmpty($signature);
-
-        // Verify with My Public Key
-        $isValid = $this->callProtectedMethod($this->strategy, 'verifySign', [$data, $signature, self::MY_PUBLIC_KEY_PEM]);
-        $this->assertTrue($isValid);
-
-        // Verify with wrong key (Kunpeng's Public Key) - should fail
-        $isInvalid = $this->callProtectedMethod($this->strategy, 'verifySign', [$data, $signature, self::KUNPENG_PUBLIC_KEY_PEM]);
-        $this->assertFalse($isInvalid);
-
-        // Tamper data - should fail verification
-        $tamperedData = $data;
-        $tamperedData['data'] = 'tampereddata';
-        $isValidTampered = $this->callProtectedMethod($this->strategy, 'verifySign', [$tamperedData, $signature, self::MY_PUBLIC_KEY_PEM]);
-        $this->assertFalse($isValidTampered);
+        return $method->invokeArgs($this->strategy, $parameters);
     }
 
     public function testPrepareRequestData()

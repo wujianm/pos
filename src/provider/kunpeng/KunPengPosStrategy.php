@@ -291,142 +291,89 @@ class KunPengPosStrategy extends PosStrategy
     }
 
     /**
-     * Prepares request data, including encryption and signing.
-     * @param array $bizData Business data (key-value pairs).
-     * @return array The final request array to be sent to Kunpeng.
-     * @throws CryptoException|\Exception
+     * 准备请求数据，包括加密和签名。
+     * 此方法现在将实际的加密和签名操作委托给 KunPengCryptoUtil 工具类。
+     *
+     * @param array $bizData 业务数据 (键值对)。
+     * @return array 最终发送给鲲鹏的请求参数数组。
+     * @throws CryptoException|\Exception 如果加密、签名或JSON编码失败。
      */
     protected function prepareRequestData(array $bizData): array
     {
-        $aesKey = $this->generateAesKey();
-        $this->rawRequest['generated_aes_key'] = $aesKey; // Log for debugging
-
-        $bizDataJson = json_encode($bizData, JSON_UNESCAPED_UNICODE);
-        if ($bizDataJson === false) {
-            throw new \InvalidArgumentException('Failed to JSON encode business data: ' . json_last_error_msg());
+        $cryptoLog = []; // 用于从KunPengCryptoUtil收集日志
+        $requestParams = \think\pos\extend\kunpeng\KunPengCryptoUtil::prepareKunPengRequest(
+            $bizData,
+            $this->config['appId'],
+            $this->config['kunPengPublicKey'],
+            $this->config['privateKey'],
+            $cryptoLog
+        );
+        // 将 cryptoLog 中的信息合并到 $this->rawRequest 供上层记录
+        if (!empty($cryptoLog)) {
+            // 使用特定前缀避免覆盖 $this->rawRequest 中已有的通用日志字段
+            foreach($cryptoLog as $key => $value) {
+                $this->rawRequest['crypto_detail_' . $key] = $value;
+            }
         }
-        $this->rawRequest['biz_data_json'] = $bizDataJson; // Log for debugging
-
-        $encryptedData = $this->aesEncrypt($bizDataJson, $aesKey);
-        $encryptedAesKey = $this->rsaEncrypt($aesKey, $this->config['kunPengPublicKey']);
-
-        $requestParams = [
-            'appId' => $this->config['appId'],
-            'encryptKey' => $encryptedAesKey,
-            'data' => $encryptedData,
-            'timestamp' => (string)(int)(microtime(true) * 1000),
-        ];
-
-        $requestParams['sign'] = $this->generateSign($requestParams, $this->config['privateKey']);
-        $this->rawRequest['final_request_params'] = $requestParams; // Log final params before sending
-
         return $requestParams;
     }
 
     /**
-     * Processes response data, including signature verification and decryption.
-     * @param array $responseData Kunpeng's raw array response data.
-     * @return array|null Decrypted business data array, or null on failure.
-     * @throws CryptoException
+     * 处理响应数据，包括验签和解密。
+     * 此方法现在将实际的验签和解密操作委托给 KunPengCryptoUtil 工具类。
+     *
+     * @param array $responseData 鲲鹏返回的原始数组数据 (已json_decode)。
+     * @return array|null 解密后的业务数据数组，或在失败时返回null。
+     * @throws CryptoException 如果验签、解密或JSON解析失败。
      */
     protected function processResponseData(array $responseData): ?array
     {
-        $this->rawResponse['body_array'] = $responseData; // Log received array
+        $this->rawResponse['body_array'] = $responseData; // 记录原始解码后的响应数组
 
-        if (!isset($responseData['sign'], $responseData['encryptKey'], $responseData['data'])) {
-            $errorMessage = 'Response missing required fields (sign, encryptKey, or data). Response: ' . json_encode($responseData);
-            $this->rawResponse['error_detail'] = $errorMessage;
-            throw new CryptoException($errorMessage);
+        $cryptoLog = [];
+        $decryptedBizData = \think\pos\extend\kunpeng\KunPengCryptoUtil::processKunPengResponse(
+            $responseData,
+            $this->config['privateKey'],
+            $this->config['kunPengPublicKey'],
+            $cryptoLog
+        );
+
+        if (!empty($cryptoLog)) {
+            foreach($cryptoLog as $key => $value) {
+                $this->rawResponse['crypto_detail_' . $key] = $value;
+            }
         }
-
-        $sign = $responseData['sign'];
-        $dataToVerify = $responseData;
-        // buildSignString will unset 'sign' from a copy of $dataToVerify or from $dataToVerify itself if passed by reference (depends on PHP version array copy-on-write)
-        // To be safe, let's pass a copy to buildSignString if it modifies, or ensure it doesn't.
-        // Current buildSignString unsets from the array passed to it.
-
-        if (!$this->verifySign($dataToVerify, $sign, $this->config['kunPengPublicKey'])) {
-            $errorMessage = 'Response signature verification failed. String to verify: ' . $this->buildSignString($dataToVerify) . '. Signature: ' . $sign;
-            $this->rawResponse['error_detail'] = $errorMessage;
-            throw new CryptoException($errorMessage);
-        }
-        $this->rawResponse['signature_verified'] = true;
-
-
-        $encryptedAesKey = $responseData['encryptKey'];
-        $encryptedData = $responseData['data'];
-
-        $aesKey = $this->rsaDecrypt($encryptedAesKey, $this->config['privateKey']);
-        $this->rawResponse['decrypted_aes_key'] = $aesKey; // Log for debugging
-
-        $decryptedDataJson = $this->aesDecrypt($encryptedData, $aesKey);
-        $this->rawResponse['decrypted_body_json'] = $decryptedDataJson; // Log decrypted JSON
-
-        $decodedData = json_decode($decryptedDataJson, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            $errorMessage = 'Failed to decode decrypted JSON data: ' . json_last_error_msg() . '. JSON: ' . $decryptedDataJson;
-            $this->rawResponse['error_detail'] = $errorMessage;
-            throw new CryptoException($errorMessage);
-        }
-        return $decodedData;
+        // processKunPengResponse 失败时会抛出CryptoException，由上层捕获
+        return $decryptedBizData;
     }
 
      /**
-     * Processes callback notification data.
-     * @param string $rawCallbackContent Raw POST callback content (JSON string).
-     * @return array|null Decrypted business data array, or null on failure.
-     * @throws CryptoException
+     * 处理回调通知数据。
+     * 此方法现在将实际的验签和解密操作委托给 KunPengCryptoUtil 工具类。
+     *
+     * @param string $rawCallbackContent POST的原始回调内容 (JSON字符串)。
+     * @return array|null 解密后的业务数据数组（包含_serviceType等元数据），或在失败时返回null。
+     * @throws CryptoException 如果JSON解析、验签或解密失败。
      */
     protected function processCallbackData(string $rawCallbackContent): ?array
     {
-        $this->rawResponse['body'] = $rawCallbackContent; // Store raw callback content
+        $this->rawResponse['body'] = $rawCallbackContent; // 记录原始回调内容
 
-        $callbackData = json_decode($rawCallbackContent, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            $errorMessage = 'Failed to decode callback JSON: ' . json_last_error_msg() . '. Raw content: ' . $rawCallbackContent;
-            $this->rawResponse['error_detail'] = $errorMessage;
-            throw new CryptoException($errorMessage);
+        $cryptoLog = [];
+        $decryptedData = \think\pos\extend\kunpeng\KunPengCryptoUtil::processKunPengCallback(
+            $rawCallbackContent,
+            $this->config['privateKey'],
+            $this->config['kunPengPublicKey'],
+            $cryptoLog
+        );
+
+        if (!empty($cryptoLog)) {
+             foreach($cryptoLog as $key => $value) {
+                $this->rawResponse['crypto_detail_' . $key] = $value;
+            }
         }
-        $this->rawResponse['callback_data_array'] = $callbackData;
-
-
-        if (!isset($callbackData['sign'], $callbackData['encryptKey'], $callbackData['data'], $callbackData['serviceType'])) {
-            $errorMessage = 'Callback missing required fields (sign, encryptKey, data, or serviceType). Callback data: ' . $rawCallbackContent;
-            $this->rawResponse['error_detail'] = $errorMessage;
-            throw new CryptoException($errorMessage);
-        }
-
-        $sign = $callbackData['sign'];
-        $dataToVerify = $callbackData;
-
-        if (!$this->verifySign($dataToVerify, $sign, $this->config['kunPengPublicKey'])) {
-             $errorMessage = 'Callback signature verification failed. String to verify: ' . $this->buildSignString($dataToVerify) . '. Signature: ' . $sign;
-             $this->rawResponse['error_detail'] = $errorMessage;
-             throw new CryptoException($errorMessage);
-        }
-        $this->rawResponse['callback_signature_verified'] = true;
-
-        $encryptedAesKey = $callbackData['encryptKey'];
-        $encryptedData = $callbackData['data'];
-
-        $aesKey = $this->rsaDecrypt($encryptedAesKey, $this->config['privateKey']);
-        $this->rawResponse['decrypted_aes_key_callback'] = $aesKey; // Log for debugging
-
-        $decryptedDataJson = $this->aesDecrypt($encryptedData, $aesKey);
-        $this->rawResponse['decrypted_body_json_callback'] = $decryptedDataJson; // Log decrypted JSON
-
-        $decodedData = json_decode($decryptedDataJson, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            $errorMessage = 'Failed to decode decrypted callback JSON data: ' . json_last_error_msg() . '. JSON: ' . $decryptedDataJson;
-            $this->rawResponse['error_detail'] = $errorMessage;
-            throw new CryptoException($errorMessage);
-        }
-
-        $decodedData['_serviceType'] = $callbackData['serviceType'];
-        if (isset($callbackData['appId'])) {
-             $decodedData['_appId'] = $callbackData['appId'];
-        }
-        return $decodedData;
+         // processKunPengCallback 失败时会抛出CryptoException，由上层捕获
+        return $decryptedData;
     }
 
     /**
